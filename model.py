@@ -314,23 +314,10 @@ class HierarchicalSemanticRefinementModule(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, token_ids, use_hsrm: bool = True, collect_debug: bool = False):
+    def forward(self, token_ids, collect_debug: bool = False):
 
         simple_emb = self.simple_embedding(token_ids)
         zero_loss = torch.tensor(0.0, device=simple_emb.device)
-
-        if not use_hsrm:
-            debug_info = None
-            if collect_debug:
-                debug_info = {
-                    "simple_emb": simple_emb.detach(),
-                    "fused_emb": simple_emb.detach(),
-                    "gate_scalar": torch.zeros(*simple_emb.shape[:-1], 1, device=simple_emb.device),
-                    "path_gate": torch.tensor(0.0, device=simple_emb.device),
-                    "refine_gate": torch.tensor(0.0, device=simple_emb.device),
-                    "scale_gates": torch.zeros(self.multiscale_adapter.num_scales, device=simple_emb.device),
-                }
-            return simple_emb, zero_loss, debug_info
 
         # Get base continuous representations
         base_emb = self.base_embedding(token_ids)
@@ -497,7 +484,6 @@ class Model(nn.Module, GenerationMixin):
         # Diffusion-specific configuration
         self.diffusion_steps = config.get('diffusion_steps', 4)
         self.codebook_diffusion_steps = config.get('codebook_diffusion_steps', 3)
-        self.use_latent_bridge = config.get('use_latent_bridge', True)
 
         # Semantic embedding (frozen, pre-trained)
         self.semantic_embedding = nn.Embedding(self.n_items, self.semantic_hidden_size)
@@ -526,44 +512,17 @@ class Model(nn.Module, GenerationMixin):
 
         # Latent Diffusion Bridge
         gap_margin = config.get('bridge_gap_margin', 0.1)
-        if self.use_latent_bridge:
-            self.latent_bridge = LatentDiffusionBridge(
-                encoder_dim=e_dim,
-                decoder_dim=self.semantic_hidden_size,
-                latent_dim=max(e_dim, self.semantic_hidden_size),
-                num_steps=self.diffusion_steps,
-                gap_margin=gap_margin,
-            )
-        else:
-            self.latent_bridge = None
+        self.latent_bridge = LatentDiffusionBridge(
+            encoder_dim=e_dim,
+            decoder_dim=self.semantic_hidden_size,
+            latent_dim=max(e_dim, self.semantic_hidden_size),
+            num_steps=self.diffusion_steps,
+            gap_margin=gap_margin,
+        )
 
         self.apply(self._init_weights)
 
-        # Runtime switches
-        self.use_hsrm = bool(config.get('use_hsrm', True))
         self.collect_visualization = False
-
-    def set_ablation_mode(self, mode: str = "full"):
-        """
-        Runtime ablation switch (no config file needed).
-        Modes: full, w/o_hsrm, w/o_ldb, baseline
-        """
-        mode = mode.lower().strip()
-        if mode in {"full", "all"}:
-            self.use_hsrm = True
-            self.use_latent_bridge = True
-        elif mode in {"w/o_hsrm", "without_hsrm", "no_hsrm"}:
-            self.use_hsrm = False
-            self.use_latent_bridge = True
-        elif mode in {"w/o_ldb", "without_ldb", "no_ldb", "w/o_latent_bridge"}:
-            self.use_hsrm = True
-            self.use_latent_bridge = False
-        elif mode in {"baseline", "w/o_both", "without_both", "no_both"}:
-            self.use_hsrm = False
-            self.use_latent_bridge = False
-        else:
-            raise ValueError(f"Unknown ablation mode: {mode}")
-        return {"use_hsrm": self.use_hsrm, "use_latent_bridge": self.use_latent_bridge}
 
     def set_visualization_mode(self, enabled: bool = True):
         self.collect_visualization = bool(enabled)
@@ -622,7 +581,6 @@ class Model(nn.Module, GenerationMixin):
             token_ids = input_ids_clean[:, i::self.code_length]
             emb, _reg_loss, token_debug = self.token_embeddings[i](
                 token_ids,
-                use_hsrm=self.use_hsrm,
                 collect_debug=collect_debug,
             )
             # _reg_loss is DISCARDED (v3: no HSRM reg in training)
@@ -699,7 +657,6 @@ class Model(nn.Module, GenerationMixin):
                 else:
                     emb, _, _ = self.token_embeddings[i - 1](
                         decoder_input_ids[:, i],
-                        use_hsrm=self.use_hsrm,
                         collect_debug=False,
                     )
                     decoder_inputs_embeds.append(emb)
@@ -734,16 +691,11 @@ class Model(nn.Module, GenerationMixin):
         dec_latents = self.dec_adapter(dec_latents)
 
 
-        bridge_gap_loss = torch.tensor(0.0, device=self.device)
-        ldb_debug_info = None
-
-        if self.use_latent_bridge and self.latent_bridge is not None:
-            bridged_enc, bridged_dec, gap_loss, ldb_debug_info = self.latent_bridge(
-                seq_project_latents, dec_latents, collect_debug=collect_debug,
-            )
-            seq_project_latents = bridged_enc
-            dec_latents = bridged_dec
-            bridge_gap_loss = gap_loss
+        bridged_enc, bridged_dec, bridge_gap_loss, ldb_debug_info = self.latent_bridge(
+            seq_project_latents, dec_latents, collect_debug=collect_debug,
+        )
+        seq_project_latents = bridged_enc
+        dec_latents = bridged_dec
 
 
         debug_info = None
